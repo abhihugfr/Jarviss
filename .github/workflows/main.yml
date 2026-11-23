@@ -1,0 +1,108 @@
+# Builds the debug APK first (so tests can never block it), then runs tests/lint/release as extras.
+# If the build fails, the real Kotlin errors ("e: ...") are shown in the run Summary and as annotations.
+# Keep this repository PRIVATE. Never commit app/google-services.json, keystores or API keys.
+# Optional repo secret GOOGLE_SERVICES_JSON = google-services.json, base64-encoded (enables Connected Mode).
+name: Build APK
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Optional Firebase config from secret
+        env:
+          GSJ: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GSJ" ]; then
+            echo "$GSJ" | base64 -d > app/google-services.json
+          else
+            echo "No GOOGLE_SERVICES_JSON secret: building without Firebase."
+          fi
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --console=plain --stacktrace 2>&1 | tee build.log
+
+      - name: Show Kotlin errors
+        if: failure()
+        run: |
+          {
+            echo "## Build errors (e: lines)"
+            echo '```'
+            grep -E "^e: " build.log | sed -E 's#file://[^ ]*/app/src#app/src#' | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E "^e: " build.log | sed -E 's#file://[^ ]*/app/src#app/src#' | head -20 | while IFS= read -r l; do echo "::error::$l"; done || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Unit tests (do not block the APK)
+        continue-on-error: true
+        run: gradle :app:testDebugUnitTest --console=plain --stacktrace
+
+      - name: Build release APK (unsigned unless keystore.properties exists)
+        continue-on-error: true
+        run: gradle :app:assembleRelease --console=plain
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-release-apk-unsigned
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-and-reports
+          path: |
+            build.log
+            app/build/reports/**
+            app/build/test-results/**
+          if-no-files-found: ignore
+
+  firestore-rules-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install --no-audit --no-fund
+        working-directory: firestore-tests
+      - run: npx -y firebase-tools@13 emulators:exec --only firestore --project demo-jarvis "cd firestore-tests && node --test"
